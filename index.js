@@ -3,17 +3,21 @@
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const crypto = require('crypto'); // for request ids
+const crypto = require('crypto');
 
 const app = express();
-app.use(function(req, res, next) {
-  console.log(`[req] ${req.method} ${req.originalUrl} ct=${req.headers['content-type']||''}`);
-  next();
-});
 
 /** ---------- Config ---------- */
 const allowedRootDomain = process.env.ALLOWED_ROOT_DOMAIN || 'robinsonandhenry.com';
-// add more comma-separated domains if needed (e.g., staging)
+
+/* Add every non-robinsonandhenry origin you load pages from:
+   - GTM Preview
+   - Unbounce domains
+   - Staging domains
+   Comma-separated list, no spaces (or spaces are ok; they’ll be trimmed)
+   Example:
+   EXTRA_ALLOWED_ORIGINS=https://preview.tagmanager.google.com,https://yourpage.unbouncepages.com,https://staging.robinsonandhenry.com
+*/
 const extraAllowedOrigins = (process.env.EXTRA_ALLOWED_ORIGINS || '')
   .split(',')
   .map(s => s.trim())
@@ -22,14 +26,25 @@ const extraAllowedOrigins = (process.env.EXTRA_ALLOWED_ORIGINS || '')
 const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
-// Keep payloads small and sane for beacons
+/** ---------- Body parsers ---------- */
+// JSON for normal fetch/XHR
 app.use(express.json({ limit: '64kb', strict: true }));
+// text/plain for many sendBeacon implementations
+app.use(express.text({ type: 'text/plain', limit: '64kb' }));
+// application/octet-stream (belt-and-suspenders for some beacons)
+app.use(express.raw({ type: 'application/octet-stream', limit: '64kb' }));
+
+/** ---------- Request logger (helps you see preflights, origins, and content-type) ---------- */
+app.use(function(req, res, next) {
+  console.log(`[req] ${req.method} ${req.originalUrl} origin=${req.headers.origin || ''} ct=${req.headers['content-type'] || ''}`);
+  next();
+});
 
 /** ---------- CORS ---------- */
 app.use(cors({
-  origin: function (origin, callback) {
-    // allow non-browser / same-origin / null origins (sendBeacon can present null in some contexts)
-    if (!origin) return callback(null, true);
+  origin: function (origin, cb) {
+    // allow non-browser / same-origin / null origins
+    if (!origin) return cb(null, true);
 
     try {
       const hostname = new URL(origin).hostname;
@@ -42,33 +57,41 @@ app.use(cors({
         try {
           const h = new URL(o).hostname || o;
           return hostname === h || hostname.endsWith('.' + h);
-        } catch { return hostname === o || hostname.endsWith('.' + o); }
+        } catch {
+          // handle plain host strings in env
+          return hostname === o || hostname.endsWith('.' + o);
+        }
       });
 
-      if (baseAllowed || extraAllowed) return callback(null, true);
-      return callback(new Error('Not allowed by CORS: ' + origin));
+      if (baseAllowed || extraAllowed) return cb(null, true);
+      return cb(new Error('Not allowed by CORS: ' + origin));
     } catch (err) {
-      return callback(new Error('Invalid origin: ' + origin));
+      return cb(new Error('Invalid origin: ' + origin));
     }
   },
   methods: ['POST', 'GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Accept'],
   credentials: false,
-  maxAge: 86400 // cache preflight for a day
+  maxAge: 86400
 }));
 
-// Explicit OPTIONS handler to short-circuit preflights quickly
+// Fast path for preflights so the browser proceeds to POST
 app.options('*', (req, res) => res.sendStatus(204));
 
 /** ---------- Health ---------- */
-app.get('/healthz', (req, res) => res.status(200).send('ok'));
-app.get('/', (req, res) => res.status(200).send('Zapier-only proxy is running 🚀'));
+app.get('/healthz', (req, res) => {
+  console.log('[healthz] ok');
+  res.status(200).send('ok');
+});
+
+app.get('/', (req, res) => {
+  res.status(200).send('Zapier-only proxy is running 🚀');
+});
 
 /** ---------- Minimal schema validator ---------- */
-/* Keep this permissive; just prevent junk/oversized payloads */
 function validatePayload(p) {
   if (!p || typeof p !== 'object') return 'invalid body';
-  // allow list common top-level keys; ignore extras but gate absurd payloads
+
   const allowedTop = new Set([
     'client_id','session_id','atraid','atrauid',
     'timestamp','page_url','page_path','page_title',
@@ -82,35 +105,30 @@ function validatePayload(p) {
     'event_type','event_params'
   ]);
 
-  // basic type checks
   if ('session_id' in p && p.session_id !== '' && typeof p.session_id !== 'number') return 'session_id must be number or empty';
   if ('event_params' in p && p.event_params && typeof p.event_params !== 'object') return 'event_params must be object';
 
-  // rough size gate on event_params to prevent abuse
   if (p.event_params && JSON.stringify(p.event_params).length > 8192) return 'event_params too large';
 
-  // prune unknown top-level keys (optional)
   Object.keys(p).forEach(k => { if (!allowedTop.has(k)) delete p[k]; });
 
   return null;
 }
 
-/** ---------- Zapier client w/ timeouts & retry ---------- */
+/** ---------- Zapier client ---------- */
 const zapier = axios.create({
-  timeout: 5000, // 5s
+  timeout: 5000,
   headers: { 'Content-Type': 'application/json' },
-  validateStatus: s => s >= 200 && s < 500 // treat 5xx as errors
+  validateStatus: s => s >= 200 && s < 500
 });
 
 async function forwardToZapier(payload) {
   if (!ZAPIER_WEBHOOK_URL) throw new Error('ZAPIER_WEBHOOK_URL not configured');
-  // one quick retry on transient 5xx
   try {
     const res = await zapier.post(ZAPIER_WEBHOOK_URL, payload);
     if (res.status >= 500) throw new Error('Zapier 5xx');
     return res.status;
   } catch (e) {
-    // retry once
     const res2 = await zapier.post(ZAPIER_WEBHOOK_URL, payload);
     if (res2.status >= 500) throw new Error('Zapier 5xx (retry)');
     return res2.status;
@@ -118,13 +136,24 @@ async function forwardToZapier(payload) {
 }
 
 /** ---------- Collect endpoint ---------- */
-// Prefer a dedicated path, but keep '/' for backward compatibility
-app.post(['/', '/collect'], async (req, res) => {
+app.post(['/collect', '/'], async (req, res) => {
   const rid = crypto.randomBytes(8).toString('hex');
-  const payload = req.body;
 
-  // Minimal logging (avoid PII)
-  console.log(`[${rid}] recv event_type=${payload && payload.event_type} cid=${payload && payload.client_id} sid=${payload && payload.session_id}`);
+  // Coerce non-JSON bodies (text/plain or octet-stream) into JSON
+  if (typeof req.body === 'string' && req.body.length) {
+    try { req.body = JSON.parse(req.body); } catch { req.body = {}; }
+  } else if (Buffer.isBuffer(req.body)) {
+    try { req.body = JSON.parse(req.body.toString('utf8')); } catch { req.body = {}; }
+  }
+
+  const payload = req.body || {};
+  console.log(`[${rid}] recv event_type=${payload.event_type} cid=${payload.client_id} sid=${payload.session_id}`);
+
+  // Reject truly empty bodies so you know why things are blank
+  if (!payload || Object.keys(payload).length === 0) {
+    console.warn(`[${rid}] empty body`);
+    return res.status(400).json({ error: 'empty body' });
+  }
 
   const errMsg = validatePayload(payload);
   if (errMsg) {
@@ -134,10 +163,7 @@ app.post(['/', '/collect'], async (req, res) => {
 
   try {
     const status = await forwardToZapier(payload);
-    if (status >= 200 && status < 300) {
-      // For sendBeacon callers, 204 No Content is ideal (no body)
-      return res.sendStatus(204);
-    }
+    if (status >= 200 && status < 300) return res.sendStatus(204);
     console.warn(`[${rid}] Zapier non-2xx: ${status}`);
     return res.status(502).json({ error: 'Bad gateway to Zapier', status });
   } catch (err) {
@@ -145,6 +171,12 @@ app.post(['/', '/collect'], async (req, res) => {
     return res.status(502).json({ error: 'Zapier forwarding failed' });
   }
 });
+
+/** ---------- Process signals (logs if the platform kills the app) ---------- */
+process.on('unhandledRejection', r => console.error('UNHANDLED REJECTION:', r));
+process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION:', e));
+process.on('SIGTERM', () => { console.log('SIGTERM'); process.exit(0); });
+process.on('SIGINT',  () => { console.log('SIGINT');  process.exit(0); });
 
 /** ---------- Start ---------- */
 app.listen(PORT, () => {
