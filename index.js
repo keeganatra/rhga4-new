@@ -1,90 +1,61 @@
+'use strict';
+
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
+const crypto = require('crypto');
 
 const app = express();
 
-const allowedRootDomain = 'robinsonandhenry.com';
-
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // allow non-browser requests
-
-    try {
-      const hostname = new URL(origin).hostname;
-
-      const isAllowed =
-        hostname === allowedRootDomain ||
-        hostname.endsWith('.' + allowedRootDomain);
-
-      if (isAllowed) {
-        callback(null, true);
-      } else {
-        callback(new Error('Not allowed by CORS: ' + origin));
-      }
-    } catch (err) {
-      callback(new Error('Invalid origin: ' + origin));
-    }
-  },
-  methods: ['POST', 'GET', 'OPTIONS'],
-  allowedHeaders: ['Content-Type'],
-  credentials: true
-}));
-
-
-app.use(express.json());
-
+/** ---------- Config (Railway envs) ---------- */
+const ALLOWED_ROOT_DOMAIN = process.env.ALLOWED_ROOT_DOMAIN || 'robinsonandhenry.com';
+const EXTRA_ALLOWED_ORIGINS = (process.env.EXTRA_ALLOWED_ORIGINS || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
 
 /** ---------- Body parsers ---------- */
-// JSON for normal fetch/XHR
+// JSON for fetch/XHR
 app.use(express.json({ limit: '64kb', strict: true }));
 // text/plain for many sendBeacon implementations
 app.use(express.text({ type: 'text/plain', limit: '64kb' }));
-// application/octet-stream (belt-and-suspenders for some beacons)
+// octet-stream for any odd beacons
 app.use(express.raw({ type: 'application/octet-stream', limit: '64kb' }));
 
-/** ---------- Request logger (helps you see preflights, origins, and content-type) ---------- */
+/** ---------- Request logger ---------- */
 app.use(function(req, res, next) {
   console.log(`[req] ${req.method} ${req.originalUrl} origin=${req.headers.origin || ''} ct=${req.headers['content-type'] || ''}`);
   next();
 });
 
-// ---------- CORS (robust origin parser) ----------
-const allowedRootDomain = process.env.ALLOWED_ROOT_DOMAIN || 'robinsonandhenry.com';
-const extraAllowedOrigins = (process.env.EXTRA_ALLOWED_ORIGINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-
-// Safe hostname extractor (no URL constructor needed)
+/** ---------- CORS (robust origin parser) ---------- */
 function getHostnameFromOrigin(orig) {
-  if (!orig) return '';                           // null/undefined -> allow later
+  if (!orig) return '';
   var s = String(orig).trim().toLowerCase();
-  // Strip protocol
-  s = s.replace(/^https?:\/\//, '');
-  // Drop path/query/hash if any
-  s = s.split('/')[0] || s;
-  // Drop port if any
-  s = s.split(':')[0] || s;
+  s = s.replace(/^https?:\/\//, ''); // strip scheme
+  s = s.split('/')[0] || s;          // strip path
+  s = s.split('?')[0] || s;          // strip query
+  s = s.split('#')[0] || s;          // strip hash
+  s = s.split(':')[0] || s;          // strip port
   return s;
 }
 
 app.use(cors({
   origin: function (origin, cb) {
-    // allow same-origin, server-to-server, or no Origin (beacons sometimes)
+    // allow same-origin / server-to-server / null origin
     if (!origin) return cb(null, true);
 
-    const hostname = getHostnameFromOrigin(origin);
+    const host = getHostnameFromOrigin(origin);
 
-    // Base rule: *.allowedRootDomain
     const baseAllowed =
-      hostname === allowedRootDomain ||
-      hostname.endsWith('.' + allowedRootDomain);
+      host === ALLOWED_ROOT_DOMAIN ||
+      host.endsWith('.' + ALLOWED_ROOT_DOMAIN);
 
-    // Extra allowlist from env (accept domain or full URL)
-    const extraAllowed = extraAllowedOrigins.some(function (o) {
-      var h = getHostnameFromOrigin(o);
-      return hostname === h || hostname.endsWith('.' + h);
+    const extraAllowed = EXTRA_ALLOWED_ORIGINS.some(function (o) {
+      const h = getHostnameFromOrigin(o);
+      return host === h || host.endsWith('.' + h);
     });
 
     if (baseAllowed || extraAllowed) return cb(null, true);
@@ -96,10 +67,8 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// Important: let cors() respond to preflights with ACAO headers
+// Important: let cors() answer preflights with ACAO headers
 app.options('*', cors());
-
-
 
 /** ---------- Health ---------- */
 app.get('/healthz', (req, res) => {
@@ -128,13 +97,14 @@ function validatePayload(p) {
     'event_type','event_params'
   ]);
 
-  if ('session_id' in p && p.session_id !== '' && typeof p.session_id !== 'number') return 'session_id must be number or empty';
-  if ('event_params' in p && p.event_params && typeof p.event_params !== 'object') return 'event_params must be object';
-
-  if (p.event_params && JSON.stringify(p.event_params).length > 8192) return 'event_params too large';
+  if ('session_id' in p && p.session_id !== '' && typeof p.session_id !== 'number')
+    return 'session_id must be number or empty';
+  if ('event_params' in p && p.event_params && typeof p.event_params !== 'object')
+    return 'event_params must be object';
+  if (p.event_params && JSON.stringify(p.event_params).length > 8192)
+    return 'event_params too large';
 
   Object.keys(p).forEach(k => { if (!allowedTop.has(k)) delete p[k]; });
-
   return null;
 }
 
@@ -172,7 +142,6 @@ app.post(['/collect', '/'], async (req, res) => {
   const payload = req.body || {};
   console.log(`[${rid}] recv event_type=${payload.event_type} cid=${payload.client_id} sid=${payload.session_id}`);
 
-  // Reject truly empty bodies so you know why things are blank
   if (!payload || Object.keys(payload).length === 0) {
     console.warn(`[${rid}] empty body`);
     return res.status(400).json({ error: 'empty body' });
@@ -195,7 +164,7 @@ app.post(['/collect', '/'], async (req, res) => {
   }
 });
 
-/** ---------- Process signals (logs if the platform kills the app) ---------- */
+/** ---------- Signals ---------- */
 process.on('unhandledRejection', r => console.error('UNHANDLED REJECTION:', r));
 process.on('uncaughtException', e => console.error('UNCAUGHT EXCEPTION:', e));
 process.on('SIGTERM', () => { console.log('SIGTERM'); process.exit(0); });
@@ -204,6 +173,6 @@ process.on('SIGINT',  () => { console.log('SIGINT');  process.exit(0); });
 /** ---------- Start ---------- */
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`Allowed domain: ${allowedRootDomain}`);
-  if (extraAllowedOrigins.length) console.log(`Extra allowed origins: ${extraAllowedOrigins.join(', ')}`);
+  console.log(`Allowed domain: ${ALLOWED_ROOT_DOMAIN}`);
+  if (EXTRA_ALLOWED_ORIGINS.length) console.log(`Extra allowed origins: ${EXTRA_ALLOWED_ORIGINS.join(', ')}`);
 });
