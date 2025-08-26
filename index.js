@@ -1,27 +1,38 @@
-'use strict';
-
 const express = require('express');
 const cors = require('cors');
 const axios = require('axios');
-const crypto = require('crypto');
 
 const app = express();
 
-/** ---------- Config ---------- */
-const allowedRootDomain = process.env.ALLOWED_ROOT_DOMAIN || 'robinsonandhenry.com';
+const allowedRootDomain = 'robinsonandhenry.com';
 
-/* Add every non-robinsonandhenry origin you load pages from:
-   - GTM Preview
-   - Unbounce domains
-   - Staging domains
-   Comma-separated list, no spaces (or spaces are ok; they’ll be trimmed)
-   Example:
-   EXTRA_ALLOWED_ORIGINS=https://preview.tagmanager.google.com,https://yourpage.unbouncepages.com,https://staging.robinsonandhenry.com
-*/
-const extraAllowedOrigins = (process.env.EXTRA_ALLOWED_ORIGINS || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // allow non-browser requests
+
+    try {
+      const hostname = new URL(origin).hostname;
+
+      const isAllowed =
+        hostname === allowedRootDomain ||
+        hostname.endsWith('.' + allowedRootDomain);
+
+      if (isAllowed) {
+        callback(null, true);
+      } else {
+        callback(new Error('Not allowed by CORS: ' + origin));
+      }
+    } catch (err) {
+      callback(new Error('Invalid origin: ' + origin));
+    }
+  },
+  methods: ['POST', 'GET', 'OPTIONS'],
+  allowedHeaders: ['Content-Type'],
+  credentials: true
+}));
+
+
+app.use(express.json());
 
 const ZAPIER_WEBHOOK_URL = process.env.ZAPIER_WEBHOOK_URL;
 const PORT = process.env.PORT || 3000;
