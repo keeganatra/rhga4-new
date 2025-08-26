@@ -6,6 +6,10 @@ const axios = require('axios');
 const crypto = require('crypto'); // for request ids
 
 const app = express();
+app.use(function(req, res, next) {
+  console.log(`[req] ${req.method} ${req.originalUrl} ct=${req.headers['content-type']||''}`);
+  next();
+});
 
 /** ---------- Config ---------- */
 const allowedRootDomain = process.env.ALLOWED_ROOT_DOMAIN || 'robinsonandhenry.com';
