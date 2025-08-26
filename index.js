@@ -76,7 +76,8 @@ app.use(cors({
 }));
 
 // Fast path for preflights so the browser proceeds to POST
-app.options('*', (req, res) => res.sendStatus(204));
+app.options('*', cors()); // <-- this returns 204 *with* the CORS headers
+
 
 /** ---------- Health ---------- */
 app.get('/healthz', (req, res) => {
