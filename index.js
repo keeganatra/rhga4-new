@@ -51,34 +51,44 @@ app.use(function(req, res, next) {
   next();
 });
 
-/** ---------- CORS ---------- */
+// ---------- CORS (robust origin parser) ----------
+const allowedRootDomain = process.env.ALLOWED_ROOT_DOMAIN || 'robinsonandhenry.com';
+const extraAllowedOrigins = (process.env.EXTRA_ALLOWED_ORIGINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
+
+// Safe hostname extractor (no URL constructor needed)
+function getHostnameFromOrigin(orig) {
+  if (!orig) return '';                           // null/undefined -> allow later
+  var s = String(orig).trim().toLowerCase();
+  // Strip protocol
+  s = s.replace(/^https?:\/\//, '');
+  // Drop path/query/hash if any
+  s = s.split('/')[0] || s;
+  // Drop port if any
+  s = s.split(':')[0] || s;
+  return s;
+}
+
 app.use(cors({
   origin: function (origin, cb) {
-    // allow non-browser / same-origin / null origins
+    // allow same-origin, server-to-server, or no Origin (beacons sometimes)
     if (!origin) return cb(null, true);
 
-    try {
-      const hostname = new URL(origin).hostname;
+    const hostname = getHostnameFromOrigin(origin);
 
-      const baseAllowed =
-        hostname === allowedRootDomain ||
-        hostname.endsWith('.' + allowedRootDomain);
+    // Base rule: *.allowedRootDomain
+    const baseAllowed =
+      hostname === allowedRootDomain ||
+      hostname.endsWith('.' + allowedRootDomain);
 
-      const extraAllowed = extraAllowedOrigins.some(o => {
-        try {
-          const h = new URL(o).hostname || o;
-          return hostname === h || hostname.endsWith('.' + h);
-        } catch {
-          // handle plain host strings in env
-          return hostname === o || hostname.endsWith('.' + o);
-        }
-      });
+    // Extra allowlist from env (accept domain or full URL)
+    const extraAllowed = extraAllowedOrigins.some(function (o) {
+      var h = getHostnameFromOrigin(o);
+      return hostname === h || hostname.endsWith('.' + h);
+    });
 
-      if (baseAllowed || extraAllowed) return cb(null, true);
-      return cb(new Error('Not allowed by CORS: ' + origin));
-    } catch (err) {
-      return cb(new Error('Invalid origin: ' + origin));
-    }
+    if (baseAllowed || extraAllowed) return cb(null, true);
+    return cb(new Error('Not allowed by CORS: ' + origin));
   },
   methods: ['POST', 'GET', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Accept'],
@@ -86,8 +96,9 @@ app.use(cors({
   maxAge: 86400
 }));
 
-// Fast path for preflights so the browser proceeds to POST
-app.options('*', cors()); // <-- this returns 204 *with* the CORS headers
+// Important: let cors() respond to preflights with ACAO headers
+app.options('*', cors());
+
 
 
 /** ---------- Health ---------- */
